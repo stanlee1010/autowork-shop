@@ -12,7 +12,9 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.security.SecureRandom;
+import java.time.LocalDate;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -40,6 +42,9 @@ public class AutoShopServer {
 
     private final InventoryStore store;
     private final UserStore users;
+    private final SalesStore sales;
+    private final Settings settings;
+    private final NotificationStore notifications;
 
     private record Session(String username, long expiresAt) {}
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
@@ -51,9 +56,12 @@ public class AutoShopServer {
         void handle(HttpExchange ex, User user) throws IOException;
     }
 
-    public AutoShopServer(InventoryStore store, UserStore users) {
+    public AutoShopServer(InventoryStore store, UserStore users, SalesStore sales, Settings settings, NotificationStore notifications) {
         this.store = store;
         this.users = users;
+        this.sales = sales;
+        this.settings = settings;
+        this.notifications = notifications;
     }
 
     /** Optional arguments: port (default 8080) and data folder (default "data"). */
@@ -63,7 +71,10 @@ public class AutoShopServer {
 
         InventoryStore store = new InventoryStore(dataDir.resolve("inventory.csv"));
         UserStore users = new UserStore(dataDir.resolve("users.csv"));
-        AutoShopServer app = new AutoShopServer(store, users);
+        SalesStore sales = new SalesStore(dataDir.resolve("sales.tsv"));
+        Settings settings = new Settings(dataDir.resolve("settings.properties"));
+        AutoShopServer app = new AutoShopServer(store, users, sales, settings,
+            new NotificationStore(dataDir.resolve("notifications.tsv")));
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         // Open to everyone
@@ -78,6 +89,17 @@ public class AutoShopServer {
         server.createContext("/inventory/adjust", app.guard(Permission.ADJUST_STOCK, app::handleAdjust));
         server.createContext("/inventory/edit", app.guard(Permission.EDIT_PRODUCT, app::handleEdit));
         server.createContext("/inventory/delete", app.guard(Permission.DELETE_PRODUCT, app::handleDelete));
+        // The Sales page is open to sellers, storekeepers and people who see the money; it checks inside.
+        server.createContext("/sales", app.guard(null, app::handleSales));
+        server.createContext("/sales/receipt", app.guard(null, app::handleReceipt));
+        server.createContext("/sales/new", app.guard(Permission.SELL, app::handleSaleNew));
+        server.createContext("/sales/cancel", app.guard(Permission.SELL, app::handleSaleCancel));
+        server.createContext("/sales/issue", app.guard(Permission.ADJUST_STOCK, app::handleSaleIssue));
+        server.createContext("/sales/return", app.guard(Permission.SELL, app::handleSaleReturn));
+        server.createContext("/sales/return-undo", app.guard(Permission.SELL, app::handleSaleReturnUndo));
+        server.createContext("/sales/receive", app.guard(Permission.ADJUST_STOCK, app::handleSaleReceive));
+        server.createContext("/sales/tax", app.guard(null, app::handleTax));
+        server.createContext("/notifications", app.guard(null, app::handleNotifications));
         server.createContext("/staff", app.guard(Permission.MANAGE_STAFF, app::handleStaff));
         server.createContext("/staff/add", app.guard(Permission.MANAGE_STAFF, app::handleStaffAdd));
         server.createContext("/staff/role", app.guard(Permission.MANAGE_STAFF, app::handleStaffRole));
@@ -108,14 +130,7 @@ public class AutoShopServer {
                     return;
                 }
                 if (needed != null && !user.can(needed)) {
-                    String body = """
-                        <div class="page-head">
-                          <h1>%s No access</h1>
-                          <p class="muted">Your role (%s) is not allowed to do this. Ask the Owner / Director if you need access.</p>
-                        </div>
-                        <a class="btn" href="/">Back to dashboard</a>
-                        """.formatted(Icons.SHIELD, h(user.getRole().getLabel()));
-                    sendHtml(ex, 403, page(user, "No access", "", body));
+                    sendDenied(ex, user);
                     return;
                 }
                 page.handle(ex, user);
@@ -124,6 +139,17 @@ public class AutoShopServer {
                 sendText(ex, 500, "Server error");
             }
         };
+    }
+
+    private void sendDenied(HttpExchange ex, User user) throws IOException {
+        String body = """
+            <div class="page-head">
+              <h1>%s No access</h1>
+              <p class="muted">Your role (%s) is not allowed to do this. Ask the Owner / Director if you need access.</p>
+            </div>
+            <a class="btn" href="/">Back to dashboard</a>
+            """.formatted(Icons.SHIELD, h(user.getRole().getLabel()));
+        sendHtml(ex, 403, page(user, "No access", "", body));
     }
 
     /** The signed-in user for this request, or null. */
@@ -315,6 +341,16 @@ public class AutoShopServer {
             }
             tiles.append(tile("Low stock alerts", String.valueOf(store.lowStockCount()), store.lowStockCount() > 0));
         }
+        if (seesSalesMoney(user)) {
+            tiles.append(tile("Sales today", money(sales.totalOn(LocalDate.now())), false));
+        }
+        if (canSeeSales(user)) {
+            tiles.append(tile("Sales waiting for storekeeper", String.valueOf(sales.pendingCount()), sales.pendingCount() > 0));
+        }
+        if (seesNotifications(user)) {
+            long unread = notifications.unreadCount(user.getUsername());
+            tiles.append(tile("Unread notifications", String.valueOf(unread), unread > 0));
+        }
         String subtitle = user.getRole() == Role.OWNER
             ? "Full business control and financial overview."
             : "Welcome, " + h(user.getFullName()) + ". Use the list on the left to open the pages your role can use.";
@@ -437,7 +473,7 @@ public class AutoShopServer {
                 <label>Category<input name="category" required list="cats" placeholder="e.g. Brakes"></label>
                 <datalist id="cats">%s</datalist>
                 <label>Quantity<input type="number" name="quantity" min="0" value="0" required></label>
-                <label>Unit price<input type="number" name="price" min="0" step="0.01" value="0.00" required></label>
+                <label>Unit price (TSh)<input type="number" name="price" min="0" step="0.01" value="0.00" required></label>
                 <label>Low stock alert at<input type="number" name="low" min="0" value="5" required></label>
                 <div class="form-actions"><button class="btn primary">Add product</button></div>
               </form>
@@ -453,7 +489,7 @@ public class AutoShopServer {
             <div class="chips">%s</div>
             <table>
               <thead>
-                <tr><th>#</th><th>Product</th><th>Category</th><th class="num">Qty</th><th class="num">Unit price</th>%s%s</tr>
+                <tr><th>#</th><th>Product</th><th>Category</th><th class="num">Qty</th><th class="num">Unit price (TSh)</th>%s%s</tr>
               </thead>
               <tbody>%s</tbody>
             </table>
@@ -555,7 +591,7 @@ public class AutoShopServer {
                 <label>Category<input name="category" required list="cats" value="%s"></label>
                 <datalist id="cats">%s</datalist>
                 <label>Quantity<input type="number" name="quantity" min="0" value="%d" required></label>
-                <label>Unit price<input type="number" name="price" min="0" step="0.01" value="%.2f" required></label>
+                <label>Unit price (TSh)<input type="number" name="price" min="0" step="0.01" value="%.2f" required></label>
                 <label>Low stock alert at<input type="number" name="low" min="0" value="%d" required></label>
                 <div class="form-actions"><button class="btn primary">Save changes</button></div>
               </form>
@@ -574,6 +610,437 @@ public class AutoShopServer {
         } catch (NumberFormatException e) {
             redirect(ex, "/inventory?err=" + enc("Invalid product id"));
         }
+    }
+
+    // ---------------------------------------------------------------- sales
+
+    private static final int SALE_ROWS = 6;
+    private static final String[] PAYMENT_METHODS = {"Cash", "Mobile money", "Card", "Bank transfer"};
+
+    /** Sellers, storekeepers (who hand the goods over) and people who see the money may open Sales. */
+    private static boolean canSeeSales(User user) {
+        return user.can(Permission.SELL) || user.can(Permission.ADJUST_STOCK) || user.can(Permission.VIEW_FINANCIALS);
+    }
+
+    /** Storekeepers see what to hand over, but not prices and totals. */
+    private static boolean seesSalesMoney(User user) {
+        return user.can(Permission.SELL) || user.can(Permission.VIEW_FINANCIALS);
+    }
+
+    /** The director (owner) and the manager are told about discounts and tax set on sales. */
+    private static boolean seesNotifications(User user) {
+        return user.getRole() == Role.OWNER || user.getRole() == Role.MANAGER;
+    }
+
+    /** Owner, manager and accountant set the standard tax rate that the sale form starts with. */
+    private static boolean canSetTax(User user) {
+        return user.can(Permission.VIEW_FINANCIALS) && user.can(Permission.EDIT_PRODUCT);
+    }
+
+    /** 16.0 shows as "16", 7.5 as "7.5". */
+    private static String pct(double v) {
+        return v == Math.rint(v) ? String.valueOf((long) v) : String.valueOf(v);
+    }
+
+    private void handleSales(HttpExchange ex, User user) throws IOException {
+        if (!ex.getRequestURI().getPath().equals("/sales")) {
+            sendText(ex, 404, "Not found");
+            return;
+        }
+        if (!canSeeSales(user)) { sendDenied(ex, user); return; }
+
+        Map<String, String> q = parseQuery(ex.getRequestURI().getRawQuery());
+        boolean canSell = user.can(Permission.SELL);
+        boolean canIssue = user.can(Permission.ADJUST_STOCK);
+        boolean showMoney = seesSalesMoney(user);
+        String statusFilter = q.getOrDefault("status", "");
+
+        StringBuilder body = new StringBuilder();
+        body.append("<div class=\"page-head\"><h1>").append(Icons.CART).append(" Sales / POS</h1>")
+            .append("<p class=\"muted\">The shopkeeper records the sale. The storekeeper then hands the goods over, and only then does the stock go down.</p></div>")
+            .append(flash(q));
+
+        // Summary tiles
+        body.append("<div class=\"stats\">");
+        if (showMoney) {
+            body.append(tile("Sales today", money(sales.totalOn(LocalDate.now())), false));
+            body.append(tile("Number of sales today", String.valueOf(sales.countOn(LocalDate.now())), false));
+        }
+        body.append(tile("Waiting for storekeeper", String.valueOf(sales.pendingCount()), sales.pendingCount() > 0));
+        body.append("</div>");
+
+        // New sale form
+        if (canSell) {
+            String options = productOptions();
+            StringBuilder rows = new StringBuilder();
+            for (int i = 1; i <= SALE_ROWS; i++) {
+                rows.append("<div class=\"sale-row\"><select name=\"product").append(i).append("\"")
+                    .append(i == 1 ? " required" : "").append(">").append(options).append("</select>")
+                    .append("<input type=\"number\" name=\"qty").append(i).append("\" min=\"1\" value=\"1\" title=\"Quantity\">")
+                    .append("<input type=\"number\" name=\"disc").append(i).append("\" min=\"0\" step=\"0.01\" value=\"0\" title=\"Amount of money off each one\"></div>");
+            }
+            StringBuilder pay = new StringBuilder();
+            for (String m : PAYMENT_METHODS) pay.append("<option>").append(m).append("</option>");
+            body.append("""
+                <div class="card">
+                  <h2>New sale</h2>
+                  <p class="muted">Choose up to %d products. Leave the rows you do not need on "Choose a product".</p>
+                  <form method="post" action="/sales/new">
+                    <div class="sale-rows">
+                      <div class="sale-row head"><span>Product</span><span>Quantity</span><span>Discount off each (TSh)</span></div>
+                      %s
+                    </div>
+                    <div class="grid">
+                      <label>Customer name (optional)<input name="customer" placeholder="Walk-in customer" maxlength="60"></label>
+                      <label>Payment method<select name="payment">%s</select></label>
+                      <label>Tax percent (standard rate is %s)<input type="number" name="tax" min="0" max="100" step="0.01" value="%s"></label>
+                      <div class="form-actions">
+                        <button class="btn primary">Record sale</button>
+                        <span class="muted tax-note">Tax is a percentage of the total after the discounts, and is added to it. The manager and the director are notified of any discount, and of tax different from the standard rate.</span>
+                      </div>
+                    </div>
+                  </form>
+                </div>
+                """.formatted(SALE_ROWS, rows, pay, pct(settings.getTaxPercent()), pct(settings.getTaxPercent())));
+        }
+
+        // Sales list
+        body.append("<div class=\"chips\">");
+        body.append("<a class=\"chip").append(statusFilter.isEmpty() ? " active" : "").append("\" href=\"/sales\">All sales</a>");
+        for (Sale.Status st : Sale.Status.values()) {
+            body.append("<a class=\"chip").append(st.name().equalsIgnoreCase(statusFilter) ? " active" : "")
+                .append("\" href=\"/sales?status=").append(st.name()).append("\">").append(h(st.getLabel())).append("</a>");
+        }
+        body.append("</div>");
+
+        body.append("<table><thead><tr><th>#</th><th>Date</th><th>Customer</th><th>Goods</th>");
+        if (showMoney) body.append("<th class=\"num\">Total</th><th>Payment</th>");
+        body.append("<th>Sold by</th><th>Status</th><th>Actions</th></tr></thead><tbody>");
+        int shown = 0;
+        for (Sale s : sales.all()) {
+            if (!statusFilter.isEmpty() && !s.getStatus().name().equalsIgnoreCase(statusFilter)) continue;
+            if (++shown > 200) break;
+            body.append("<tr><td>").append(s.getId()).append("</td><td>").append(h(s.getSoldAtText())).append("</td><td>")
+                .append(h(s.getCustomer())).append("</td><td>");
+            for (Sale.Line l : s.getLines()) {
+                body.append("<div>").append(l.quantity()).append(" &times; ").append(h(l.name())).append("</div>");
+            }
+            body.append("</td>");
+            if (showMoney) {
+                body.append("<td class=\"num\">").append(money(s.total()));
+                if (s.hasDiscount()) {
+                    body.append("<div class=\"muted small\">discount ").append(money(s.discount()))
+                        .append(" (").append(s.discountKind()).append(")</div>");
+                }
+                if (s.getTaxPercent() > 0) {
+                    body.append("<div class=\"muted small\">incl. tax ").append(money(s.tax())).append("</div>");
+                }
+                body.append("</td><td>").append(h(s.getPayment())).append("</td>");
+            }
+            body.append("<td>").append(h(s.getSoldBy())).append("</td><td><span class=\"status ")
+                .append(s.getStatus().name().toLowerCase()).append("\">").append(h(s.getStatus().getLabel())).append("</span>");
+            if (s.getHandledBy() != null) {
+                body.append("<div class=\"muted small\">by ").append(h(s.getHandledBy())).append(", ").append(h(s.getHandledAtText())).append("</div>");
+            }
+            if (!s.getNote().isEmpty()) {
+                body.append("<div class=\"muted small\">Reason: ").append(h(s.getNote())).append("</div>");
+            }
+            body.append("</td><td class=\"actions\">");
+            if (s.getStatus() == Sale.Status.ISSUED && canSell) {
+                body.append("<form method=\"post\" action=\"/sales/return\" class=\"inline\"><input type=\"hidden\" name=\"id\" value=\"")
+                    .append(s.getId()).append("\"><input type=\"text\" name=\"reason\" placeholder=\"Reason for return\" required maxlength=\"80\">")
+                    .append("<button class=\"btn bad\">Return</button></form>");
+            }
+            if (s.getStatus() == Sale.Status.RETURN_PENDING && canIssue) {
+                body.append("<form method=\"post\" action=\"/sales/receive\" class=\"inline\"><input type=\"hidden\" name=\"id\" value=\"")
+                    .append(s.getId()).append("\"><button class=\"btn ok\">Receive goods back</button></form>");
+            }
+            if (s.getStatus() == Sale.Status.RETURN_PENDING && canSell) {
+                body.append("<form method=\"post\" action=\"/sales/return-undo\" class=\"inline\"><input type=\"hidden\" name=\"id\" value=\"")
+                    .append(s.getId()).append("\"><button class=\"btn\">Undo return</button></form>");
+            }
+            if (s.getStatus() == Sale.Status.PENDING && canIssue) {
+                body.append("<form method=\"post\" action=\"/sales/issue\" class=\"inline\"><input type=\"hidden\" name=\"id\" value=\"")
+                    .append(s.getId()).append("\"><button class=\"btn ok\">Issue goods</button></form>");
+            }
+            if (s.getStatus() == Sale.Status.PENDING && canSell) {
+                body.append("<form method=\"post\" action=\"/sales/cancel\" class=\"inline\" onsubmit=\"return confirm('Cancel sale ")
+                    .append(s.getId()).append("?')\"><input type=\"hidden\" name=\"id\" value=\"")
+                    .append(s.getId()).append("\"><button class=\"btn bad\">Cancel</button></form>");
+            }
+            if (showMoney) body.append("<a class=\"btn\" href=\"/sales/receipt?id=").append(s.getId()).append("\">Receipt</a>");
+            body.append("</td></tr>");
+        }
+        if (shown == 0) {
+            body.append("<tr><td colspan=\"").append(showMoney ? 9 : 7).append("\" class=\"muted center\">No sales to show yet.</td></tr>");
+        }
+        body.append("</tbody></table>");
+
+        // Tax rate setting
+        if (canSetTax(user)) {
+            body.append("""
+                <div class="card">
+                  <h2>Standard tax rate</h2>
+                  <p class="muted">The new sale form starts with this rate. The seller can change it for a sale, and the manager and the director are then notified. Sales already recorded keep the rate they were made with.</p>
+                  <form method="post" action="/sales/tax" class="grid">
+                    <label>Standard tax percent<input type="number" name="tax" min="0" max="100" step="0.01" value="%s" required></label>
+                    <div class="form-actions"><button class="btn primary">Save tax rate</button></div>
+                  </form>
+                </div>
+                """.formatted(pct(settings.getTaxPercent())));
+        }
+
+        sendHtml(ex, 200, page(user, "Sales", "/sales", body.toString()));
+    }
+
+    /** Dropdown of products grouped by category. Goods that cannot be sold right now are greyed out. */
+    private String productOptions() {
+        Map<Integer, Integer> reserved = sales.reserved();
+        StringBuilder sb = new StringBuilder("<option value=\"\">Choose a product</option>");
+        String current = null;
+        for (Product p : store.all()) {
+            if (!p.getCategory().equals(current)) {
+                if (current != null) sb.append("</optgroup>");
+                current = p.getCategory();
+                sb.append("<optgroup label=\"").append(h(current)).append("\">");
+            }
+            int available = p.getQuantity() - reserved.getOrDefault(p.getId(), 0);
+            String note;
+            boolean sellable = false;
+            if (p.getUnitPrice() <= 0) note = "no price set";
+            else if (available <= 0) note = "out of stock";
+            else { note = money(p.getUnitPrice()) + " each, " + available + " available"; sellable = true; }
+            sb.append("<option value=\"").append(p.getId()).append("\"").append(sellable ? "" : " disabled").append(">")
+              .append(h(p.getName())).append(" (").append(note).append(")</option>");
+        }
+        if (current != null) sb.append("</optgroup>");
+        return sb.toString();
+    }
+
+    private void handleSaleNew(HttpExchange ex, User user) throws IOException {
+        if (!isPost(ex)) { redirect(ex, "/sales"); return; }
+        Map<String, String> f = parseQuery(readBody(ex));
+        try {
+            Map<Integer, Integer> wanted = new LinkedHashMap<>();
+            Map<Integer, Double> discounts = new LinkedHashMap<>();
+            for (int i = 1; i <= SALE_ROWS; i++) {
+                String product = f.getOrDefault("product" + i, "").trim();
+                if (product.isEmpty()) continue;
+                int id;
+                try {
+                    id = Integer.parseInt(product);
+                    wanted.merge(id, Integer.parseInt(f.getOrDefault("qty" + i, "1").trim()), Integer::sum);
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("Quantities must be whole numbers");
+                }
+                try {
+                    String d = f.getOrDefault("disc" + i, "").trim();
+                    // The same product on two rows gets the bigger of the two discounts.
+                    discounts.merge(id, d.isEmpty() ? 0 : Double.parseDouble(d), Math::max);
+                } catch (NumberFormatException e) {
+                    throw new IllegalArgumentException("Discounts must be amounts of money, like 5 or 2.50");
+                }
+            }
+            String payment = f.getOrDefault("payment", PAYMENT_METHODS[0]);
+            if (!List.of(PAYMENT_METHODS).contains(payment)) payment = PAYMENT_METHODS[0];
+            String customer = f.getOrDefault("customer", "");
+            if (customer.length() > 60) customer = customer.substring(0, 60);
+            double standardTax = settings.getTaxPercent();
+            double tax;
+            try {
+                String t = f.getOrDefault("tax", "").trim();
+                tax = t.isEmpty() ? standardTax : Double.parseDouble(t);
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("Tax must be a number");
+            }
+            Sale sale = sales.create(store, user.getUsername(), customer, payment, wanted, discounts, tax);
+
+            // Tell the manager and the director what the seller decided.
+            List<String> what = new java.util.ArrayList<>();
+            if (sale.hasDiscount()) {
+                List<String> items = new java.util.ArrayList<>();
+                for (Sale.Line l : sale.getLines()) {
+                    if (l.discount() > 0) items.add(money(l.discount()) + " off each of " + l.quantity() + " x " + l.name());
+                }
+                what.add("gave a discount of " + String.join(", ", items) + " (" + money(sale.discount()) + " off in total)");
+            }
+            if (tax != standardTax) {
+                what.add("charged " + pct(tax) + " percent tax (" + money(sale.tax()) + ") instead of the standard " + pct(standardTax) + " percent");
+            }
+            boolean notified = !what.isEmpty();
+            if (notified) {
+                notifications.add(sale.getId(), user.getFullName() + " (" + user.getUsername() + ") " + String.join(" and ", what)
+                    + " on sale " + sale.getId() + " to " + sale.getCustomer() + ". Total " + money(sale.total()) + ".");
+            }
+            redirect(ex, "/sales?msg=" + enc("Sale " + sale.getId() + " recorded, total " + money(sale.total())
+                + ". It is now waiting for the storekeeper to hand over the goods."
+                + (notified ? " The manager and the director have been notified of the discount or tax." : "")));
+        } catch (IllegalArgumentException e) {
+            redirect(ex, "/sales?err=" + enc(e.getMessage()));
+        }
+    }
+
+    private void handleSaleIssue(HttpExchange ex, User user) throws IOException {
+        if (!isPost(ex)) { redirect(ex, "/sales"); return; }
+        Map<String, String> f = parseQuery(readBody(ex));
+        try {
+            Sale sale = sales.issue(parseId(f.get("id")), store, user.getUsername());
+            redirect(ex, "/sales?msg=" + enc("Goods issued for sale " + sale.getId() + ". Stock has been reduced."));
+        } catch (IllegalArgumentException e) {
+            redirect(ex, "/sales?err=" + enc(e.getMessage()));
+        }
+    }
+
+    private void handleSaleCancel(HttpExchange ex, User user) throws IOException {
+        if (!isPost(ex)) { redirect(ex, "/sales"); return; }
+        Map<String, String> f = parseQuery(readBody(ex));
+        try {
+            Sale sale = sales.cancel(parseId(f.get("id")), user.getUsername());
+            redirect(ex, "/sales?msg=" + enc("Sale " + sale.getId() + " cancelled. The goods are free to sell again."));
+        } catch (IllegalArgumentException e) {
+            redirect(ex, "/sales?err=" + enc(e.getMessage()));
+        }
+    }
+
+    private void handleSaleReturn(HttpExchange ex, User user) throws IOException {
+        if (!isPost(ex)) { redirect(ex, "/sales"); return; }
+        Map<String, String> f = parseQuery(readBody(ex));
+        try {
+            String reason = f.getOrDefault("reason", "");
+            if (reason.length() > 80) reason = reason.substring(0, 80);
+            Sale sale = sales.requestReturn(parseId(f.get("id")), user.getUsername(), reason);
+            redirect(ex, "/sales?msg=" + enc("Return recorded for sale " + sale.getId() + ". Refund due: " + money(sale.total())
+                + ". It is now waiting for the storekeeper to receive the goods back."));
+        } catch (IllegalArgumentException e) {
+            redirect(ex, "/sales?err=" + enc(e.getMessage()));
+        }
+    }
+
+    private void handleSaleReturnUndo(HttpExchange ex, User user) throws IOException {
+        if (!isPost(ex)) { redirect(ex, "/sales"); return; }
+        Map<String, String> f = parseQuery(readBody(ex));
+        try {
+            Sale sale = sales.undoReturn(parseId(f.get("id")), user.getUsername());
+            redirect(ex, "/sales?msg=" + enc("Return undone. Sale " + sale.getId() + " stands as sold."));
+        } catch (IllegalArgumentException e) {
+            redirect(ex, "/sales?err=" + enc(e.getMessage()));
+        }
+    }
+
+    private void handleSaleReceive(HttpExchange ex, User user) throws IOException {
+        if (!isPost(ex)) { redirect(ex, "/sales"); return; }
+        Map<String, String> f = parseQuery(readBody(ex));
+        try {
+            Sale sale = sales.receiveReturn(parseId(f.get("id")), store, user.getUsername());
+            redirect(ex, "/sales?msg=" + enc("Goods received back for sale " + sale.getId() + ". Stock has been increased."));
+        } catch (IllegalArgumentException e) {
+            redirect(ex, "/sales?err=" + enc(e.getMessage()));
+        }
+    }
+
+    private void handleTax(HttpExchange ex, User user) throws IOException {
+        if (!canSetTax(user)) { sendDenied(ex, user); return; }
+        if (!isPost(ex)) { redirect(ex, "/sales"); return; }
+        Map<String, String> f = parseQuery(readBody(ex));
+        try {
+            double rate;
+            try {
+                rate = Double.parseDouble(f.getOrDefault("tax", "").trim());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("Tax rate must be a number");
+            }
+            settings.setTaxPercent(rate);
+            redirect(ex, "/sales?msg=" + enc("Standard tax rate set to " + pct(rate) + " percent."));
+        } catch (IllegalArgumentException e) {
+            redirect(ex, "/sales?err=" + enc(e.getMessage()));
+        }
+    }
+
+    /** Messages for the manager and the director. Opening the page marks them as read. */
+    private void handleNotifications(HttpExchange ex, User user) throws IOException {
+        if (!seesNotifications(user)) { sendDenied(ex, user); return; }
+        StringBuilder body = new StringBuilder();
+        body.append("<div class=\"page-head\"><h1>").append(Icons.BELL).append(" Notifications</h1>")
+            .append("<p class=\"muted\">Discounts and tax that sellers set on sales. New ones are marked until you have opened this page.</p></div>");
+        body.append("<table><thead><tr><th>Date</th><th>Message</th><th>Sale</th></tr></thead><tbody>");
+        int shown = 0;
+        for (NotificationStore.Notification n : notifications.all()) {
+            if (++shown > 200) break;
+            boolean unread = !n.isReadBy(user.getUsername());
+            body.append("<tr").append(unread ? " class=\"unread\"" : "").append("><td>").append(h(n.getAtText()));
+            if (unread) body.append(" <span class=\"badge\">New</span>");
+            body.append("</td><td>").append(h(n.getText())).append("</td><td><a class=\"btn\" href=\"/sales/receipt?id=")
+                .append(n.getSaleId()).append("\">Receipt</a></td></tr>");
+        }
+        if (shown == 0) body.append("<tr><td colspan=\"3\" class=\"muted center\">No notifications yet.</td></tr>");
+        body.append("</tbody></table>");
+        notifications.markAllRead(user.getUsername());
+        sendHtml(ex, 200, page(user, "Notifications", "/notifications", body.toString()));
+    }
+
+    private static int parseId(String s) {
+        try {
+            return Integer.parseInt(s == null ? "" : s.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Sale not found");
+        }
+    }
+
+    private void handleReceipt(HttpExchange ex, User user) throws IOException {
+        if (!seesSalesMoney(user)) { sendDenied(ex, user); return; }
+        Map<String, String> q = parseQuery(ex.getRequestURI().getRawQuery());
+        Sale s;
+        try {
+            s = sales.find(parseId(q.get("id"))).orElse(null);
+        } catch (IllegalArgumentException e) {
+            s = null;
+        }
+        if (s == null) { redirect(ex, "/sales?err=" + enc("Sale not found")); return; }
+
+        StringBuilder lines = new StringBuilder();
+        for (Sale.Line l : s.getLines()) {
+            lines.append("<tr><td>").append(h(l.name()))
+                 .append(l.discount() > 0 ? "<div class=\"muted small\">Discount " + money(l.discount()) + " off each</div>" : "")
+                 .append("</td><td class=\"num\">").append(l.quantity())
+                 .append("</td><td class=\"num\">").append(money(l.unitPrice())).append("</td><td class=\"num\">")
+                 .append(money(l.total())).append("</td></tr>");
+        }
+        // Subtotal, discount and tax rows, shown only when there is a discount or tax.
+        StringBuilder extra = new StringBuilder();
+        if (s.hasDiscount() || s.getTaxPercent() > 0) {
+            extra.append("<tr><td colspan=\"3\" class=\"num\">Subtotal</td><td class=\"num\">").append(money(s.subtotal())).append("</td></tr>");
+        }
+        if (s.hasDiscount()) {
+            extra.append("<tr><td colspan=\"3\" class=\"num\">Discount (").append(s.discountKind())
+                 .append(")</td><td class=\"num\">&minus;").append(money(s.discount())).append("</td></tr>");
+        }
+        if (s.getTaxPercent() > 0) {
+            extra.append("<tr><td colspan=\"3\" class=\"num\">Tax ").append(pct(s.getTaxPercent()))
+                 .append(" percent</td><td class=\"num\">").append(money(s.tax())).append("</td></tr>");
+        }
+        String body = """
+            <div class="page-head no-print">
+              <h1>%s Receipt</h1>
+              <p class="muted"><a href="/sales">&larr; Back to sales</a></p>
+            </div>
+            <div class="card receipt">
+              <h2>Auto Workshop</h2>
+              <p class="muted">Receipt no. %d &middot; %s</p>
+              <p>Customer: <strong>%s</strong><br>Served by: %s<br>Payment: %s<br>Status: %s</p>
+              <table>
+                <thead><tr><th>Item</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Amount</th></tr></thead>
+                <tbody>%s</tbody>
+                <tfoot>%s<tr><th colspan="3" class="num">%s</th><th class="num total">%s</th></tr></tfoot>
+              </table>
+              <button class="btn primary no-print" onclick="window.print()">Print receipt</button>
+            </div>
+            """.formatted(Icons.CART, s.getId(), h(s.getSoldAtText()), h(s.getCustomer()), h(s.getSoldBy()),
+                          h(s.getPayment()),
+                          h(s.getStatus().getLabel()) + (s.getNote().isEmpty() ? "" : " (" + h(s.getNote()) + ")"),
+                          lines, extra,
+                          s.getStatus() == Sale.Status.RETURNED ? "Refunded" : "Total",
+                          money(s.total()));
+        sendHtml(ex, 200, page(user, "Receipt", "/sales", body));
     }
 
     // ------------------------------------------------------- staff accounts
@@ -653,7 +1120,7 @@ public class AutoShopServer {
               <h2>What each role can do</h2>
               <div class="scroll"><table class="matrix">%s</table></div>
             </div>
-            """.formatted(Icons.PEOPLE, flash(q), rows, roleOptions(Role.CASHIER), UserStore.MIN_PASSWORD_LENGTH, matrix);
+            """.formatted(Icons.PEOPLE, flash(q), rows, roleOptions(Role.STAFF), UserStore.MIN_PASSWORD_LENGTH, matrix);
         sendHtml(ex, 200, page(user, "Employees", "/staff", body));
     }
 
@@ -768,7 +1235,8 @@ public class AutoShopServer {
         Object[][] links = {
             {Icons.GRID,      "Dashboard",   "/",          null},
             {Icons.BOX,       "Inventory",   "/inventory", Permission.VIEW_INVENTORY},
-            {Icons.CART,      "Sales / POS", "#",          null},
+            {Icons.CART,      "Sales / POS", "/sales",     null},
+            {Icons.BELL,      "Notifications", "/notifications", null},
             {Icons.TRUCK,     "Purchasing",  "#",          Permission.ADD_PRODUCT},
             {Icons.PEOPLE,    "Employees",   "/staff",     Permission.MANAGE_STAFF},
             {Icons.WALLET,    "Finance",     "#",          Permission.VIEW_FINANCIALS},
@@ -781,9 +1249,13 @@ public class AutoShopServer {
             Permission needed = (Permission) l[3];
             if (needed != null && !user.can(needed)) continue;
             String href = (String) l[2];
+            if (href.equals("/sales") && !canSeeSales(user)) continue;
+            if (href.equals("/notifications") && !seesNotifications(user)) continue;
             if (!href.equals("#")) {
+                long unread = href.equals("/notifications") && !href.equals(section) ? notifications.unreadCount(user.getUsername()) : 0;
                 sb.append("<a class=\"nav-link").append(href.equals(section) ? " active" : "").append("\" href=\"").append(href).append("\">")
-                  .append(l[0]).append("<span>").append(l[1]).append("</span></a>");
+                  .append(l[0]).append("<span>").append(l[1]).append("</span>")
+                  .append(unread > 0 ? "<span class=\"badge\">" + unread + "</span>" : "").append("</a>");
             } else {
                 sb.append("<span class=\"nav-link soon\" title=\"Coming soon\">")
                   .append(l[0]).append("<span>").append(l[1]).append("</span></span>");
@@ -868,6 +1340,27 @@ public class AutoShopServer {
         .search { display:flex; gap:8px; align-items:center; margin-bottom:14px; }
         .search input { flex:1; padding:10px 12px; font-size:15px; }
         .search .btn { padding:9px 16px; font-size:14px; }
+        .sale-rows { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
+        .sale-row { display:grid; grid-template-columns:1fr 110px 190px; gap:8px; }
+        .sale-row.head { color:var(--muted); font-size:13px; }
+        .status { border-radius:999px; padding:2px 10px; font-size:13px; white-space:nowrap; border:1px solid var(--line); }
+        .status.pending { color:var(--warn); border-color:var(--warn); }
+        .status.issued { color:var(--ok); border-color:var(--ok); }
+        .status.cancelled { color:var(--muted); }
+        .status.return_pending { color:var(--warn); border-color:var(--warn); white-space:normal; }
+        .status.returned { color:var(--bad); border-color:var(--bad); }
+        .tax-note { margin-left:12px; font-size:13px; }
+        tr.unread td { background:rgba(245,165,36,.08); }
+        .small { font-size:12px; margin-top:4px; }
+        .receipt { max-width:560px; }
+        .receipt table { margin:14px 0; }
+        .receipt .total { font-size:18px; color:var(--text); }
+        @media print {
+          aside.side, footer, .no-print { display:none !important; }
+          body, .card, table { background:#fff !important; color:#000 !important; }
+          .card, table { border-color:#999 !important; }
+          th, td, .muted, .receipt .total { color:#000 !important; border-color:#999 !important; }
+        }
         .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:24px; }
         .card h2 { margin:0 0 4px; font-size:18px; }
         .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:14px; margin-top:16px; }
@@ -900,7 +1393,8 @@ public class AutoShopServer {
     }
 
     private static String money(double v) {
-        return String.format("%,.2f", v);
+        // Tanzanian shillings. Cents are shown only when there are any (tax can produce them).
+        return "TSh " + String.format(v == Math.rint(v) ? "%,.0f" : "%,.2f", v);
     }
 
     /** Escape text for safe HTML output. */
@@ -961,6 +1455,7 @@ public class AutoShopServer {
         }
         static final String GRID      = svg("<rect x='3' y='3' width='7' height='7'/><rect x='14' y='3' width='7' height='7'/><rect x='3' y='14' width='7' height='7'/><rect x='14' y='14' width='7' height='7'/>");
         static final String BOX       = svg("<path d='M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z'/><path d='M3.3 7 12 12l8.7-5'/><path d='M12 22V12'/>");
+        static final String BELL      = svg("<path d='M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9'/><path d='M13.7 21a2 2 0 0 1-3.4 0'/>");
         static final String CART      = svg("<circle cx='9' cy='21' r='1'/><circle cx='20' cy='21' r='1'/><path d='M1 1h4l2.7 13.4a2 2 0 0 0 2 1.6h9.7a2 2 0 0 0 2-1.6L23 6H6'/>");
         static final String TRUCK     = svg("<rect x='1' y='3' width='15' height='13'/><path d='M16 8h4l3 3v5h-7V8z'/><circle cx='5.5' cy='18.5' r='2.5'/><circle cx='18.5' cy='18.5' r='2.5'/>");
         static final String PEOPLE    = svg("<path d='M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2'/><circle cx='9' cy='7' r='4'/><path d='M23 21v-2a4 4 0 0 0-3-3.87'/><path d='M16 3.13a4 4 0 0 1 0 7.75'/>");
